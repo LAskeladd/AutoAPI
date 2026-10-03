@@ -212,6 +212,7 @@ async def _run_one_candidate(
     virtual_model: str,
     request_started_at: float,
     ignored_error_endpoint: bool,
+    deadline: float | None = None,
 ) -> tuple[str, AttemptResult]:
     """
     在一个候选上尝试到底（含该候选内部的退避重试）喵~
@@ -229,6 +230,8 @@ async def _run_one_candidate(
     attempt_no = 1
     # 无限循环，靠内部的 return 退出；退避重试就在这个循环里打转喵
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise asyncio.TimeoutError
         # 每次 try_candidate 都代表一次真实发往上游的尝试，先记下其统一起始时刻喵
         attempt_started_at = time.monotonic()
         # 用这个候选打一次上游喵
@@ -254,7 +257,11 @@ async def _run_one_candidate(
             # 是否抑制上游模块针对忽略接口的假成功 warning 喵
             suppress_error_warnings=ignored_error_endpoint,
         )
-        # 成功了，记一笔成功（顺带会自动解冻这个候选）然后返回喵
+        # 在写入成功统计前检查预算，超时的未放行响应仍由本层关闭。
+        if deadline is not None and time.monotonic() >= deadline:
+            if result.response is not None:
+                await result.response.aclose()
+            raise asyncio.TimeoutError
         if result.ok:
             # 流式此刻只有探测成功，终态资源事件留给 server 消费完整流时写入喵
             if not is_stream and not ignored_error_endpoint:
@@ -445,8 +452,36 @@ async def _run_one_candidate(
         return "next", result
 
 
-# 特殊状态码：表示目标模式超时后需要断开连接喵
+# 旧版内部码，仅保留导入兼容；新的目标模式不会再产生这个状态。
 STATUS_DROP_CONNECTION = -5
+
+
+def _target_timeout_outcome(
+    state: RuntimeState, server: ServerConfig, virtual_model: str,
+    req_id: str, rounds: int, failures: list[str],
+) -> ProxyOutcome:
+    action = server.target_mode_timeout_action
+    if action == "drop_connection":
+        logger.warning("drop_connection 已弃用，本次改为返回 HTTP 504 喵")
+        action = "return_504"
+    status, error_type, message = {
+        "return_504": (504, "target_mode_gateway_timeout", "目标模式超时：所有链路等待超时喵"),
+        "return_429": (429, "target_mode_rate_limit", "目标模式超时：所有链路全部不可用喵"),
+        "return_502": (502, "target_mode_bad_gateway", "目标模式超时：所有链路返回错误喵"),
+    }.get(action, (504, "target_mode_timeout", "目标模式超时喵"))
+    logger.error(
+        "[%s] 目标模式结束 虚拟模型=%s 已尝试%d轮、等待%.0f秒，行为=%s 喵：%s",
+        req_id, virtual_model, rounds, server.target_mode_max_wait_seconds,
+        action, " | ".join(failures),
+    )
+    state.total_exhausted += 1
+    state.record_virtual_model_health(virtual_model, False)
+    return ProxyOutcome(success=False, status=status, error_body={"error": {
+        "message": message, "type": error_type, "virtual_model": virtual_model,
+        "target_mode": True, "rounds": rounds,
+        "waited_seconds": server.target_mode_max_wait_seconds,
+        "attempts": failures,
+    }})
 
 
 async def handle_request(
@@ -522,11 +557,11 @@ async def handle_request(
     # 判断这是流式还是非流式请求喵
     is_stream = detect_stream_flag(body_obj)
     # 判断目标模式是否开启，开关只从内存读取，不接触 config.yaml 喵
-    target_mode = state.target_mode_enabled
     # 取一份配置快照，用于读取目标模式的各项配置喵
     config = state.config
     # 判断请求是否命中配置的接口错误忽略列表喵
     ignored_error_endpoint = _is_ignored_error_endpoint(config.server, method, path)
+    target_mode = state.target_mode_enabled and not ignored_error_endpoint
     # 只有非忽略接口才累计 stats 请求总数喵
     if not ignored_error_endpoint:
         state.total_requests += 1
@@ -536,6 +571,7 @@ async def handle_request(
     )
     # 目标模式已经循环了多少轮喵
     target_rounds = 0
+    failures: list[str] = []
     # 目标模式开始时记录日志；忽略接口不会进入目标模式喵
     if target_mode and not ignored_error_endpoint:
         logger.warning(
@@ -545,6 +581,11 @@ async def handle_request(
         )
     # 目标模式外层循环：正常模式只执行一轮，目标模式整轮失败后回到链首喵
     while True:
+        if target_deadline is not None and time.monotonic() >= target_deadline:
+            return _target_timeout_outcome(
+                state, config.server, virtual_model, req_id, target_rounds,
+                failures,
+            )
         # 每一轮重新读取候选链和冻结状态，允许冻结到期或热重载在下一轮生效喵
         current_chain = state.get_chain(virtual_model) or chain
         usable, skipped = _pick_usable_candidates(state, current_chain)
@@ -556,15 +597,26 @@ async def handle_request(
             req_id, virtual_model, is_stream, len(usable), len(current_chain), target_rounds,
         )
         # 收集这一轮失败原因喵
-        failures: list[str] = list(skipped)
+        failures = list(skipped)
         # 按严格优先级依次尝试当前轮可用候选喵
         for candidate in usable:
             # 在这个候选上尝试到底（含内部退避重试）喵
-            verdict, result = await _run_one_candidate(
-                client, state, candidate, method, path, query, headers, body_obj,
-                is_stream, req_id, virtual_model, request_started_at, ignored_error_endpoint,
-            )
-            # 成功了，直接返回，后面的候选不再尝试喵
+            try:
+                attempt = _run_one_candidate(
+                    client, state, candidate, method, path, query, headers, body_obj,
+                    is_stream, req_id, virtual_model, request_started_at,
+                    ignored_error_endpoint, deadline=target_deadline,
+                )
+                if target_deadline is None:
+                    verdict, result = await attempt
+                else:
+                    remaining = max(0.0, target_deadline - time.monotonic())
+                    verdict, result = await asyncio.wait_for(attempt, timeout=remaining)
+            except asyncio.TimeoutError:
+                failures.append(f"{candidate.label} → 目标模式总等待预算用尽")
+                return _target_timeout_outcome(
+                    state, config.server, virtual_model, req_id, target_rounds, failures,
+                )
             if verdict == "ok":
                 return ProxyOutcome(success=True, attempt=result, is_stream=is_stream)
             # 规则要求原样回传上游响应（比如 400），绝不能被目标模式重试喵
@@ -616,74 +668,15 @@ async def handle_request(
                     "attempts": failures,
                 }},
             )
-        # 目标模式下，截止时间到了也要让本轮完整结束后才根据配置行为返回喵
-        now = time.monotonic()
-        if target_deadline is not None and now >= target_deadline:
-            waited_seconds = config.server.target_mode_max_wait_seconds
-            # 根据配置的超时行为决定返回什么喵
-            action = config.server.target_mode_timeout_action
-            logger.error(
-                "[%s] 目标模式结束 虚拟模型=%s 已尝试%d轮、等待%.0f秒仍无成功响应，行为=%s 喵：%s",
-                req_id, virtual_model, target_rounds, waited_seconds, action, " | ".join(failures),
+        if target_deadline is not None and time.monotonic() >= target_deadline:
+            return _target_timeout_outcome(
+                state, config.server, virtual_model, req_id, target_rounds, failures,
             )
-            # drop_connection：断开连接不返回任何响应，客户端会感知为网络超时喵
-            if action == "drop_connection":
-                # 目标模式最终失败时才增加整条链耗尽计数喵
-                state.total_exhausted += 1
-                state.record_virtual_model_health(virtual_model, False)
-                return ProxyOutcome(
-                    success=False,
-                    status=STATUS_DROP_CONNECTION,
-                    error_body={"error": {
-                        "message": "目标模式超时，断开连接喵",
-                        "type": "target_mode_drop_connection",
-                        "virtual_model": virtual_model,
-                        "rounds": target_rounds,
-                        "waited_seconds": waited_seconds,
-                    }},
-                )
-            # return_504：返回 504 Gateway Timeout，标准的网关超时状态码喵
-            elif action == "return_504":
-                status_code = 504
-                error_type = "target_mode_gateway_timeout"
-                message = "目标模式超时：所有链路等待超时喵"
-            # return_429：返回 429 Too Many Requests，表示限流喵
-            elif action == "return_429":
-                status_code = 429
-                error_type = "target_mode_rate_limit"
-                message = "目标模式超时：所有链路全部不可用喵"
-            # return_502：返回 502 Bad Gateway，伪装成上游故障喵
-            elif action == "return_502":
-                status_code = 502
-                error_type = "target_mode_bad_gateway"
-                message = "目标模式超时：所有链路返回错误喵"
-            # 喵~防御：未知行为（理论上配置加载时已经挡住了），兜底用 504 喵
-            else:
-                status_code = 504
-                error_type = "target_mode_timeout"
-                message = f"目标模式超时（未知行为 {action}）喵"
-            # 返回对应的错误响应喵
-            # 目标模式最终失败时才增加整条链耗尽计数喵
-            state.total_exhausted += 1
-            # 目标模式最终失败只结算一次虚拟模型失败喵
-            state.record_virtual_model_health(virtual_model, False)
-            return ProxyOutcome(
-                success=False,
-                status=status_code,
-                error_body={"error": {
-                    "message": message,
-                    "type": error_type,
-                    "virtual_model": virtual_model,
-                    "target_mode": True,
-                    "rounds": target_rounds,
-                    "waited_seconds": waited_seconds,
-                    "attempts": failures,
-                }},
-            )
-        # 还没到截止时间，等待配置的间隔后从链首开始下一轮喵
-        # 目标模式下的等待日志保留 warning，普通接口行为不变喵
+        delay = config.server.target_mode_round_interval_seconds
+        if target_deadline is not None:
+            delay = min(delay, max(0.0, target_deadline - time.monotonic()))
         logger.warning(
-            "[%s] 目标模式第%d轮链路全部不可用，%.0f秒后从链首重试喵：%s",
-            req_id, target_rounds, config.server.target_mode_round_interval_seconds, " | ".join(failures),
+            "[%s] 目标模式第%d轮链路全部不可用，%.1f秒后从链首重试喵：%s",
+            req_id, target_rounds, delay, " | ".join(failures),
         )
-        await asyncio.sleep(config.server.target_mode_round_interval_seconds)
+        await asyncio.sleep(delay)

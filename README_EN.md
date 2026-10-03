@@ -2,6 +2,8 @@
 
 [English](README_EN.md) | [中文](README.md)
 
+> Local maintenance version based on upstream `d3dda55`. See [LOCAL_CHANGES.md](LOCAL_CHANGES.md) for fixes, startup and validation.
+
 A transparent failover proxy for LLM APIs. Send requests to autoapi and it forwards them through an ordered chain of upstream candidates. When an upstream returns an error, a fake success (`200` with an `error` body), an empty stream, or a stalled stream, autoapi silently retries with the next candidate. Clients do not need to know that a failure occurred.
 
 For clients, autoapi behaves like a regular OpenAI-compatible endpoint: point `base_url` to autoapi, set `model` to a virtual model name, and let the proxy handle the rest.
@@ -26,10 +28,12 @@ Clients use a **virtual model** name such as `auto-strong`. Each virtual model m
 Virtual model: auto-strong
   1. Direct API   https://api.openai.com      gpt-4o
   2. Relay A      https://relay-a.example.com  gpt-4o
-  3. Claude       https://api.anthropic.com    claude-sonnet-4-20250514
+  3. Compatible   https://relay-c.example.com  gpt-4o
 ```
 
 Every request starts at the first candidate, skips candidates currently frozen, and uses the first available one. The first candidate is always preferred; fallback happens only when it fails.
+
+Protocol passthrough is not protocol translation: every candidate in a chain must accept the original client protocol. Native Anthropic endpoints belong in a separate `auto-claude` chain. Upstream root URLs and SDK-style `/v1` URLs are both accepted without duplicating the shared path prefix.
 
 ### Rule Engine
 
@@ -55,6 +59,15 @@ Automatic hedging protects against candidates that keep failing with varied erro
 Candidate chains belong to individual virtual models. If one virtual model has no available candidates, autoapi returns **502** and includes each candidate's failure reason in the `attempts` field. It never borrows candidates from another virtual model, avoiding unexpected changes in cost, capability, or data routing.
 
 ## Installation and Startup
+
+### Windows double-click launcher (local maintenance setup)
+
+Double-click `启动AutoAPI.cmd` in the project folder. It uses the project's virtual environment and keeps a visible log/REPL window. Type `quit` or press `Ctrl+C` to stop; startup errors remain visible until you press a key. Execution-policy bypass applies only to this PowerShell process, not the system setting.
+
+This local configuration listens on **127.0.0.1:18787**. Use `http://127.0.0.1:18787/v1` as the OpenAI-compatible client base URL and `auto-test` as the model. Clients previously pointing to port 8787 must be updated. Port collisions fail explicitly: the launcher neither chooses another port nor kills an existing service. The generic template/default examples below still use port 8787.
+
+The existing `start.ps1`, `-NoRepl`, and `-Config <path>` command-line options remain available.
+
 
 Requires Python 3.10 or newer.
 

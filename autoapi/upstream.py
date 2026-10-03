@@ -7,7 +7,7 @@
 
 两条路径：
     非流式：把整个响应读完，200 就算成功（顺手防一下「200 里面塞 error 字段」的假成功）
-    流式：  边读边用 StreamProbe 探测，直到确认吐出第一个有效内容字符才算成功。
+    流式：  边读边用 StreamProbe 探测，直到达到内容门槛或确认正常短回答/工具调用才算成功。
            成功时把「已经缓冲的前缀字节」和「还活着的响应对象」一起交回去，
            让 proxy 继续把后续字节吹给客户端；失败时就地关掉响应，客户端毫无感知喵。
 
@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 # AsyncIterator 用于标注流式生成器的返回类型喵
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit, urlunsplit
 
 # httpx 提供异步 HTTP 客户端喵
 import httpx
@@ -53,6 +54,7 @@ from .config import (
 )
 # 引入流探测器和结论常量喵
 from .sse import VERDICT_CONTENT, VERDICT_PENDING, StreamProbe
+from .security import redact_secrets
 
 # 逐跳请求头：这些头只对「客户端到代理」这一段连接有意义，绝不能原样转给上游喵
 HOP_BY_HOP_HEADERS = {
@@ -158,6 +160,8 @@ class AttemptResult:
     ignored_error_endpoint: bool = False
     # RPM 事件对象，流结束时补写最终 usage 喵
     rate_event: Any | None = None
+    # 规则内部状态可以为负数，HTTP 回传必须使用上游的真实状态码。
+    http_status: int | None = None
 
     @property
     def media_type(self) -> str:
@@ -615,220 +619,118 @@ async def _attempt_stream(
     body: bytes,
     timeouts: EffectiveTimeouts,
     min_content_chars: int,
-    # 忽略接口传入真值时，仅抑制本函数的假成功观测 warning 喵
     suppress_error_warnings: bool = False,
 ) -> AttemptResult:
-    """
-    走流式路径打一次上游喵~
+    """Probe before release, including headers/error bodies in the total budget.
 
-    成功的定义：HTTP 200，且在总预算 stream_timeout 之内探测到「这条流是健康的」，
-    期间上游的静默时长也没超过 stall_timeout。
-    失败时会就地关掉响应连接，客户端完全感知不到这次尝试发生过喵。
-    当 suppress_error_warnings 为真时，仍返回相同失败结果，但不记录假成功 warning 喵。
-
-    注意总预算只管到「放行」为止。一旦确认健康、字节开始流向客户端，我们就不再计时了 ——
-    模型愿意写多久就写多久，中途掐断一个正在正常输出的回答是最糟糕的行为喵。
+    Every failure or cancellation closes the response. Only a healthy released
+    stream transfers ownership to the caller.
     """
-    # 记下发起请求的时刻。总预算是从这里开始算的，包含建连和等响应头的时间，
-    # 否则「连了 4 分钟才拿到响应头」这种情况会白白绕过预算喵
     request_started_at = time.monotonic()
-    # 构造请求对象，这里还没真正发出去喵
-    # 超时按这次生效的值现算并显式传进去，这样改全局超时或节点专属超时都能当场生效喵
     request = client.build_request(
-        method, url, headers=headers, content=body, timeout=build_timeout(timeouts, is_stream=True)
+        method, url, headers=headers, content=body,
+        timeout=build_timeout(timeouts, is_stream=True),
     )
-    # 发出请求并要求流式接收（不自动读完 body）喵
     try:
-        response = await client.send(request, stream=True)
-    # 喵~防御：连接超时单独归为网络错误。连不上是「这个上游此刻不可达」，
-    # 和「上游可达但很慢」是两种故障，规则上通常也想区别对待喵
+        response = await asyncio.wait_for(
+            client.send(request, stream=True), timeout=timeouts.stream,
+        )
+    except asyncio.TimeoutError:
+        return AttemptResult(
+            ok=False, status=STATUS_TIMEOUT, started_at=request_started_at,
+            error_text=f"流式请求超过总预算 {timeouts.stream:.0f} 秒仍未收到响应头",
+        )
     except httpx.ConnectTimeout as exc:
         return AttemptResult(
-            ok=False,
-            status=STATUS_NETWORK_ERROR,
+            ok=False, status=STATUS_NETWORK_ERROR, started_at=request_started_at,
             error_text=f"连接上游超时（{timeouts.connect:.0f} 秒内没握上手）：{exc}",
-            started_at=request_started_at,
         )
-    # 喵~防御：其余超时（读、写、连接池排队）说明上游可达但太慢，归为 timeout 状态喵
     except httpx.TimeoutException as exc:
         return AttemptResult(
-            ok=False,
-            status=STATUS_TIMEOUT,
+            ok=False, status=STATUS_TIMEOUT, started_at=request_started_at,
             error_text=f"等上游响应头超时：{type(exc).__name__}: {exc}",
         )
-    # 喵~防御：连接失败、DNS 失败等网络层问题统一转成 network 状态喵
     except (httpx.HTTPError, OSError) as exc:
         return AttemptResult(
-            # 这次尝试失败喵
-            ok=False,
-            # 用网络失败的特殊状态码，好让规则里的 status: network 能命中喵
-            status=STATUS_NETWORK_ERROR,
-            # 带上异常类型和消息，方便排查喵
+            ok=False, status=STATUS_NETWORK_ERROR, started_at=request_started_at,
             error_text=f"网络错误：{type(exc).__name__}: {exc}",
         )
-    # 上游直接返回了非 200，说明请求阶段就被拒了，读完错误体后交给规则引擎判断喵
-    if response.status_code != 200:
-        # 用 try/finally 保证无论读取是否成功都会关掉连接，避免连接泄漏喵
-        try:
-            # 把错误响应体完整读出来，规则引擎要拿它做正则匹配喵
-            error_body = await response.aread()
-        # 喵~防御：连错误体都读不出来时用空字节兜底，不让异常穿透喵
-        except (httpx.HTTPError, OSError):
-            error_body = b""
-        # 无论如何都要关掉响应，释放连接池里的槽位喵
-        finally:
-            await response.aclose()
-        # 把错误体按 utf-8 解码，遇到非法字节用替换符而不是抛异常喵
-        text = error_body.decode("utf-8", errors="replace")
-        # 返回失败结果，带上状态码、错误摘要和 Retry-After 头喵
-        return AttemptResult(
-            # 失败喵
-            ok=False,
-            # 上游的真实状态码喵
-            status=response.status_code,
-            # 原始错误文本，规则引擎要用它做正则匹配，所以不做压缩只做解码喵
-            error_text=text,
-            # 上游可能通过这个头告诉我们多久后可以再试喵
-            retry_after=response.headers.get("retry-after"),
-        )
-    # 走到这里是 200，开始探测这条流到底是真健康、假成功、还是卡住了喵
-    # 字数门槛从配置里取，这样主人改了 min_content_chars 能立即生效喵
-    probe = StreamProbe(min_content_chars=min_content_chars)
-    # 暂存探测阶段读到的所有原始字节，确认健康后要原样replay给客户端喵
+
+    handed_off = False
     buffered = bytearray()
-    # 拿到字节迭代器，整个请求全程只创建这一个，探测和转发共用它喵
-    iterator = response.aiter_bytes()
-    # 观察后续 SSE 尾包里的上游 usage，完全不改动要回传的原始字节喵
-    usage_observer = StreamUsageObserver()
-    # 记录探测阶段的性能时刻，字典方便在探测函数内部更新喵
-    stream_timing: dict[str, float | None] = {"first_byte_at": None}
-    # 算出探测阶段还剩多少总预算：总预算减掉建连和等响应头已经花掉的时间喵
-    probe_budget = timeouts.stream - (time.monotonic() - request_started_at)
-    # 喵~防御：建连和等响应头就把预算耗光了（比如上游 4 分钟才给响应头，预算只有 5 分钟），
-    # 此时不要用一个负数或 0 去调探测函数，直接判超时更清楚喵
-    if probe_budget <= 0:
-        # 关掉连接释放槽位喵
-        await response.aclose()
-        # 返回超时结果，说明里写清楚是「响应头就来得太晚」喵
-        return AttemptResult(
-            ok=False,
-            status=STATUS_TIMEOUT,
-            error_text=(
-                f"等上游响应头就用光了整个 {timeouts.stream:.0f} 秒总预算，来不及读流内容"
-            ),
-        )
-    # 开始探测。两个计时器都在函数内部处理，所以这里不再额外套 wait_for 喵
+    response_headers = _filter_response_headers(response)
     try:
-        verdict, detail = await _probe_until_content(
-            # 字节迭代器喵
-            iterator,
-            # 探测器喵
-            probe,
-            # 原始字节缓冲区喵
-            buffered,
-            # 允许上游静默多少秒喵
-            timeouts.stall,
-            # 探测阶段还剩的总预算喵
-            probe_budget,
-            # 观察探测阶段已经读到的 usage 尾包喵
-            usage_observer,
-            # 回填首字节时刻的容器喵
-            stream_timing,
-        )
-    # 喵~防御：读流时超时（httpx 自己的 read 超时先响了），归为卡流。
-    # 因为 read 超时的语义正好就是「两次读取之间隔太久」，和我们的静默判定是一回事喵
-    except httpx.TimeoutException as exc:
-        # 关掉连接喵
-        await response.aclose()
-        # 返回卡流结果喵
+        if response.status_code != 200:
+            try:
+                remaining = max(0.0, timeouts.stream - (time.monotonic() - request_started_at))
+                error_body = await asyncio.wait_for(response.aread(), timeout=remaining)
+            except (httpx.HTTPError, OSError, asyncio.TimeoutError):
+                error_body = b""
+            return AttemptResult(
+                ok=False, status=response.status_code, http_status=response.status_code,
+                body=error_body, headers=response_headers,
+                error_text=error_body.decode("utf-8", errors="replace"),
+                retry_after=response.headers.get("retry-after"),
+                started_at=request_started_at,
+            )
+
+        probe = StreamProbe(min_content_chars=min_content_chars)
+        iterator = response.aiter_bytes()
+        usage_observer = StreamUsageObserver()
+        stream_timing: dict[str, float | None] = {"first_byte_at": None}
+        probe_budget = timeouts.stream - (time.monotonic() - request_started_at)
+        try:
+            verdict, detail = await _probe_until_content(
+                iterator, probe, buffered, timeouts.stall, probe_budget,
+                usage_observer, stream_timing,
+            )
+        except httpx.TimeoutException as exc:
+            verdict = PROBE_STALLED
+            detail = f"读流时上游静默超时：{type(exc).__name__}: {exc}"
+        except (httpx.HTTPError, OSError) as exc:
+            return AttemptResult(
+                ok=False, status=STATUS_NETWORK_ERROR, http_status=response.status_code,
+                body=bytes(buffered), headers=response_headers,
+                error_text=f"读取流时网络错误：{type(exc).__name__}: {exc}",
+                started_at=request_started_at,
+            )
+
+        if verdict == VERDICT_CONTENT:
+            result = AttemptResult(
+                ok=True, status=200, http_status=200, response=response,
+                buffered=bytes(buffered), iterator=iterator,
+                usage_tokens=usage_observer.tokens,
+                input_tokens=usage_observer.usage_info.input_tokens,
+                cached_tokens=usage_observer.usage_info.cached_tokens,
+                usage_observer=usage_observer, started_at=request_started_at,
+                first_byte_at=stream_timing.get("first_byte_at"),
+                released_at=time.monotonic(), headers=response_headers,
+            )
+            handed_off = True
+            return result
+
+        if verdict == PROBE_STALLED:
+            status = STATUS_STALLED_STREAM
+        elif verdict == PROBE_TIMEOUT:
+            status = STATUS_TIMEOUT
+        else:
+            status = STATUS_BAD_STREAM
+            if not suppress_error_warnings:
+                logger.warning(
+                    "假成功流被拦下喵：verdict=%s content_type=%s buffered=%d字节 detail=%s body_head=%s",
+                    verdict, response.headers.get("content-type", "<缺失>"),
+                    len(buffered), detail, _snapshot_body_for_log(bytes(buffered)),
+                )
         return AttemptResult(
-            ok=False,
-            status=STATUS_STALLED_STREAM,
-            error_text=f"读流时上游静默超时：{type(exc).__name__}: {exc}",
-        )
-    # 喵~防御：探测过程中上游把连接掐断了，归为网络错误喵
-    except (httpx.HTTPError, OSError) as exc:
-        # 关掉连接喵
-        await response.aclose()
-        # 返回网络失败结果喵
-        return AttemptResult(
-            ok=False,
-            status=STATUS_NETWORK_ERROR,
-            error_text=f"读取流时网络错误：{type(exc).__name__}: {exc}",
-        )
-    # 探测到有效内容，这条流是健康的，可以放行给客户端了喵
-    if verdict == VERDICT_CONTENT:
-        return AttemptResult(
-            # 成功喵
-            ok=True,
-            # 状态码就是 200 喵
-            status=200,
-            # 把还活着的响应对象交给 proxy，用完它负责关掉释放连接喵
-            response=response,
-            # 探测阶段已经读掉的前缀字节，proxy 要先把这些吹给客户端喵
-            buffered=bytes(buffered),
-            # 把探测用的迭代器一起带出去，转发阶段从它停下的地方接着读喵
-            iterator=iterator,
-            # 探测阶段观察到的 usage，常见情况为 None 表示上游没有上报喵
-            usage_tokens=usage_observer.tokens,
-            # 探测阶段观察到的输入 Token 喵
-            input_tokens=usage_observer.usage_info.input_tokens,
-            # 探测阶段观察到的缓存读取 Token 喵
-            cached_tokens=usage_observer.usage_info.cached_tokens,
-            # 流式转发继续复用同一个 usage 观察器喵
-            usage_observer=usage_observer,
-            # 这次请求的开始时刻喵
+            ok=False, status=status, http_status=response.status_code,
+            body=bytes(buffered), headers=response_headers,
+            error_text=detail or "上游返回 200 但流内容不正常",
             started_at=request_started_at,
-            # 首次收到任意字节的时刻喵
-            first_byte_at=stream_timing.get("first_byte_at"),
-            # 确认健康并准备放行的时刻喵
-            released_at=time.monotonic(),
-            # 上游的响应头，过滤掉逐跳头后回传给客户端喵
-            headers=_filter_response_headers(response),
         )
-    # 走到这里说明这条流不能用了，先把连接关掉释放连接池槽位喵
-    await response.aclose()
-    # 卡流单独用一个状态码，因为它的处置方式和别的不一样喵：
-    # 卡流是「等不到结论」，原地重发一次很可能就好了；而空流/error 是「已经确定坏了」，
-    # 重发同一个上游大概率还是坏的，换候选更划算。所以两者要能被不同规则分别匹配喵。
-    if verdict == PROBE_STALLED:
-        # 返回卡流状态，让规则里的 status: stalled_stream 能命中喵
-        return AttemptResult(
-            ok=False,
-            status=STATUS_STALLED_STREAM,
-            error_text=detail or "上游的流卡住了",
-        )
-    # 用光总预算也单独用一个状态码。它和卡流的区别是「连接一直健康、只是太慢」，
-    # 所以规则上可能想给它更少的重试次数（毕竟已经等了很久了）喵
-    if verdict == PROBE_TIMEOUT:
-        # 返回超时状态，让规则里的 status: timeout 能命中喵
-        return AttemptResult(
-            ok=False,
-            status=STATUS_TIMEOUT,
-            error_text=detail or "流式请求用光了总预算",
-        )
-    # 其余情况（空流、流内 error、缓冲区溢出）都归为「200 假成功」喵
-    #
-    # 忽略接口仍返回失败结果给代理层，但抑制上游模块的候选级 warning 喵
-    if not suppress_error_warnings:
-        logger.warning(
-            "假成功流被拦下喵：verdict=%s content_type=%s buffered=%d字节 detail=%s body_head=%s",
-            # 探测结论，帮主人一眼看出是空流/error/缓冲溢出中的哪一种喵
-            verdict,
-            # 上游给的 Content-Type，如果这里不是 text/event-stream 基本就实锤了「假流」喵
-            response.headers.get("content-type", "<缺失>"),
-            # 已经读到的原始字节数，配合 buffered_head 一起判断 body 是否被截断喵
-            len(buffered),
-            # 探测器/探测函数给出的原始说明文本喵
-            detail,
-            # buffered 的前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
-            _snapshot_body_for_log(bytes(buffered)),
-        )
-    return AttemptResult(
-        ok=False,
-        status=STATUS_BAD_STREAM,
-        error_text=detail or "上游返回 200 但流内容不正常",
-    )
+    finally:
+        # 包括 CancelledError：deadline 或客户端取消不能泄漏连接池槽位。
+        if not handed_off:
+            await response.aclose()
 
 
 def _snapshot_body_for_log(body: bytes, limit: int = FAKE_SUCCESS_LOG_BYTES) -> str:
@@ -961,6 +863,7 @@ async def _attempt_nonstream(
             ok=False,
             # 上游真实状态码喵
             status=response.status_code,
+            http_status=response.status_code, body=raw, headers=_filter_response_headers(response),
             # 原始错误文本喵
             error_text=raw.decode("utf-8", errors="replace"),
             # 上游给的重试建议喵
@@ -983,7 +886,10 @@ async def _attempt_nonstream(
                 # body 前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
                 _snapshot_body_for_log(raw),
             )
-        return AttemptResult(ok=False, status=STATUS_BAD_STREAM, error_text=fake)
+        return AttemptResult(
+            ok=False, status=STATUS_BAD_STREAM, error_text=fake,
+            http_status=response.status_code, body=raw, headers=_filter_response_headers(response),
+        )
     # 真正的成功，把完整响应体和响应头一起交回去喵
     usage_info = extract_usage_info_from_body(raw)
     return AttemptResult(
@@ -1004,6 +910,20 @@ async def _attempt_nonstream(
         # 过滤后的响应头喵
         headers=_filter_response_headers(response),
     )
+
+
+def build_upstream_url(base_url: str, path: str, query: str = "") -> str:
+    """Accept root URLs and SDK-style /v1 URLs without duplicating their prefix."""
+    base = urlsplit(base_url)
+    base_parts = base.path.rstrip("/").split("/")
+    request_parts = path.lstrip("/").split("/")
+    overlap = 0
+    for size in range(min(len(base_parts), len(request_parts)), 0, -1):
+        if base_parts[-size:] == request_parts[:size]:
+            overlap = size
+            break
+    joined_path = "/".join(base_parts + request_parts[overlap:])
+    return urlunsplit((base.scheme, base.netloc, joined_path, query, ""))
 
 
 async def try_candidate(
@@ -1036,11 +956,7 @@ async def try_candidate(
     输出：AttemptResult
     """
     # 拼出完整的上游地址：候选的根地址 + 客户端原始路径喵
-    url = f"{candidate.base_url}/{path.lstrip('/')}"
-    # 有查询串就原样接上，保持完全透传喵
-    if query:
-        url = f"{url}?{query}"
-    # 构造请求头：透传客户端头，但换掉鉴权头喵
+    url = build_upstream_url(candidate.base_url, path, query)
     headers = build_upstream_headers(client_headers, candidate)
     # 构造请求体：只把顶层 model 换成候选的真实模型名喵
     body = build_upstream_body(body_obj, candidate)
@@ -1078,6 +994,8 @@ async def try_candidate(
         result.started_at = attempt_started_at
     # 保存候选归属，流式响应交给 server 后仍能写回同一候选喵
     result.candidate = candidate
+    # 代理生成的错误摘要和冻结原因不得泄露上游回显的凭据。
+    result.error_text = redact_secrets(result.error_text, (candidate.api_key,))
     # 返回这一次真实上游尝试的最终探测结果喵
     return result
 
@@ -1125,10 +1043,10 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
             result.cached_tokens = result.usage_observer.usage_info.cached_tokens
         # 只有 async for 自然耗尽才标记正常完成，异常路径不会执行到这里喵
         result.stream_completed_normally = True
-    # 喵~防御：上游中途断连时不再抛给客户端（此时响应头已经发出去了，抛异常也没用），
-    # 直接结束这条流，客户端的 SDK 会按「流意外结束」处理喵
+    # 放行后不能换候选，也不能把读取错误伪装成干净 EOF；让 ASGI 中止响应。
     except (httpx.HTTPError, OSError):
-        pass
+        logger.warning("上游在流式放行后断连，本次响应不能视为完整成功喵")
+        raise
     # 无论如何都要关掉上游响应喵
     finally:
         await result.response.aclose()

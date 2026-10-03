@@ -1,7 +1,31 @@
 # autoapi
 
+## 维护版快速开始（Windows）
+
+此快照基于 happy66dev/AutoAPI 的 `d3dda551dcfa9f3089bec11b4495c68d22ee71cf`，保留原作者来源和 LICENSE，仅包含 AutoAPI 修复与双击启动优化，**不包含尚未完成的 Token 看板合并**。
+
+在项目文件夹中打开 PowerShell，使用本机已安装的 Python 创建环境：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item -LiteralPath 'config.local.example.yaml' -Destination 'config.yaml'
+```
+
+编辑本机 `config.yaml`，将 `base_url`、`api_key`、`model` 替换为自己的上游信息，再双击 **启动AutoAPI.cmd**。不要把填写后的配置上传到 GitHub。
+
+- 使用快速开始模板时，客户端 Base URL 为 `http://127.0.0.1:18787/v1`，模型名为 `auto-test`。
+- 可输入 `quit` 或按 `Ctrl+C` 停止；端口被占用时明确报错，不自动换端口，不结束其他程序。
+- 模板中的 `.invalid` 地址和 key 都是占位符，未配置前不能调用真实上游。
+- 原来的完整 `config.example` 仍保留，其默认端口是 8787、模型别名是 `auto-strong`；使用其他配置时，以该配置中的地址、端口、别名为准。
+- 完整修复和测试记录见 [LOCAL_CHANGES.md](LOCAL_CHANGES.md)。已通过 261 项底座回归和 27 项本地 HTTP 冒烟；不代表 Responses 流式或生产级安全审计已完成。
+
+---
+
 [中文](README.md) | [English](README_EN.md)
-> ⚠ **该项目已经停止维护** 该项目提供的内容已经合并到我仓库的new-api二改项目 本项目不再维护
+> **本地维护版**：当前目录基于上游 `d3dda55` 修复；改动说明和运行方法见 [LOCAL_CHANGES.md](LOCAL_CHANGES.md)。
+
+> ⚠ **上游项目已经停止维护** 该项目提供的内容已经合并到我仓库的new-api二改项目 本项目不再维护
 
 透明的 LLM API 故障转移代理喵~ 客户端把请求发给它，它按优先级链路转发给上游；上游返回错误、假成功（200 里塞 error）、空流、卡流时，它会静默换下一个候选（换 base_url / api_key / 真实模型名）重发，客户端完全感知不到发生过失败喵。
 
@@ -27,10 +51,12 @@
 虚拟模型 auto-strong
   1. 官方直连    https://api.openai.com      gpt-4o
   2. 中转A       https://relay-a.example.com  gpt-4o
-  3. Claude兜底  https://api.anthropic.com    claude-sonnet-4-20250514
+  3. 兼容兜底    https://relay-c.example.com  gpt-4o
 ```
 
 每条请求永远从链首开始，跳过正在冻结中的节点，往下找第一个可用的。链首就是你最想用的那个，只有它挂了才降级喵。
+
+**协议边界**：代理不做 OpenAI 与 Anthropic 协议互转。同一条候选链的所有节点必须支持客户端原始请求协议；原生 `/v1/messages` 请使用单独的 `auto-claude` 链。上游地址可填根地址或带 `/v1` 的地址，公共路径前缀不会重复拼接。
 
 ### 规则引擎
 
@@ -64,6 +90,20 @@
 这是刻意的设计：虚拟模型之间的成本、能力、数据流向都可能完全不同，偷偷把请求转到另一个虚拟模型的节点上，比直接失败更糟糕喵。
 
 ## 安装与启动
+
+### Windows 本地双击启动
+
+当前维护版本可以直接双击项目文件夹内的 **`启动AutoAPI.cmd`**。它使用项目自己的虚拟环境，保留日志和交互窗口；输入 `quit` 或按 `Ctrl+C` 停止，正常退出后窗口关闭。启动失败会保留窗口供查看错误，不需要修改全局 PowerShell 执行策略。
+
+本地配置固定监听 **`127.0.0.1:18787`**，客户端填写：
+
+- OpenAI 兼容 Base URL：`http://127.0.0.1:18787/v1`
+- 模型：`auto-test`
+
+原来使用 `8787` 的客户端需要修改端口。端口被占用时不会自动换号或结束其他程序；请先检查是否已经启动了一个实例，或调整 `config.yaml` 的 `server.port` 后重新启动。窗口中的实际地址以当前配置为准。
+
+原有命令行方式仍可使用：`start.ps1`、`start.ps1 -NoRepl`、`start.ps1 -Config <路径>`。双击入口也可从终端传入相同参数。以下通用安装示例和默认配置模板仍使用 `8787`，与本地维护配置的 `18787` 区分。
+
 > ⚠ **WIndows请使用Powershell启动!!**
 需要 Python 3.10 及以上（代码里用了 `X | None` 这种类型写法）喵。
 
@@ -289,7 +329,7 @@ target off
 - `target on/off/status` 只改变当前进程内存状态，重启后自动关闭；`target_mode_max_wait_seconds`、`target_mode_round_interval_seconds`、`target_mode_timeout_action` 是 YAML 配置，需手动编辑后热重载、执行 `reload` 或重启才会更新喵~
 - 已冻结的节点仍然会跳过，不会为了目标模式反复撞额度限制或绕过自动避险喵~
 - `passthrough` 仍然立即回传，不会重试客户端自己的明确错误喵~
-- 目标模式会让单个客户端请求最长占用约 `target_mode_max_wait_seconds`，请只在确实希望尽量不断线时开启喵~
+- `target_mode_max_wait_seconds` 现在严格覆盖放行前的上游调用、候选重试和退避、轮间等待。流式响应放行后不再受这个期限限制。旧的 `drop_connection` 配置会给出提醒并改为返回 504，不再假装能可移植地静默关闭 TCP 喵~
 
 代理跑起来之后，同一个终端里就是一个 REPL（提示符 `autoapi> `），可以随时看状态、改配置、清冻结，**改完立即生效，不用重启**喵。它跑在独立线程里，敲命令不会影响正在转发的请求喵。
 
@@ -395,11 +435,15 @@ set stream_timeout 600
 - 轮询间隔是每一轮现读的，所以改了 `reload_poll_interval` 当场生效。设成 `0` 关掉之后热重载任务并不退出，而是转成每 5 秒瞄一眼这个开关，所以在 REPL 里敲 `set reload_poll_interval 2` 还能重新打开，不需要重启喵。
 - `host` 和 `port` 是例外，它们在启动时就绑好了 socket，改了要重启才生效喵。
 
+REPL 修改现在先校验、再使用同目录临时文件原子替换配置，最后发布到内存；保存失败不会让内存和磁盘配置分叉。
+
 ### 已知取舍：REPL 写回会丢掉 YAML 注释
 
 REPL 里那些改配置的命令（`rule add`、`cand set`、`set`、`save` 等）写回文件时用的是 PyYAML，而 **PyYAML 不保留注释** —— 所以第一次用这类命令之后，`config.yaml` 里原本那些中文注释就没了喵。
 
 想保住注释的话，改配置时手改文件、然后靠热重载或 `reload` 命令生效，不要用 REPL 的写回类命令。`config.example` 是独立的模板文件，不会被 REPL 碰到，注释一直在喵。
+
+流式放行后若上游读取出错，代理会中止该响应并记录未正常完成，不会把异常吞成干净 EOF，也不会换候选拼接另一份回答。
 
 ## 安全提醒
 
@@ -410,7 +454,7 @@ REPL 里那些改配置的命令（`rule add`、`cand set`、`set`、`save` 等�
 另外两点：
 
 - `config.yaml` 里存着所有上游的真 api key，它**已经在 `.gitignore` 里**了。别把它从忽略列表里拿出来，也别把真 key 提交上去喵。
-- 要分享配置的话改 `config.example`，那份里面的 key 全是 `sk-REPLACE-ME-x` 这样的占位符喵。日志和 REPL 里的 key 一律脱敏成 `sk-abc***1234` 的形式，可以放心贴出来喵。
+- 要分享配置的话改 `config.example`，那份里面的 key 全是 `sk-REPLACE-ME-x` 这样的占位符喵。候选标签中的 key 会脱敏；通过 `main.py` 启动时，日志也会过滤当前和历史配置里已知的完整 key。上游原始响应和其他敏感业务内容不会被改写，分享配置、日志或响应前仍需检查并脱敏喵。
 
 ## 测试
 
@@ -439,4 +483,3 @@ python smoke_test.py
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=happy66dev/AutoAPI&type=date&legend=top-left&sealed_token=gaO5fgqPoRn51RcqFvGkYCHyixpyO9yPD65650froUViP3AMMC2DQChcSmhwpkaEPOWWdVMt2HRzVlzokORF6iUWFI_1ALW8_uMgCy-Zo377m251MOytOND_k9E0_Z_WUPsEtqeuGnQxLdoRPt5Ozq3Ad4NuSOGGgpPTEGEGI4IF8l5lTgkrgRLbRRXr" />
  </picture>
 </a>
-

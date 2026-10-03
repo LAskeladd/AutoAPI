@@ -1,0 +1,20 @@
+# 无真实凭据的维护版快速开始模板。复制为 config.yaml 后仅在本机填写上游信息。
+# 已知端口被占用时明确退出，不抢占、不静默换端口。
+server:
+  host: 127.0.0.1
+  port: 18787
+  reload_poll_interval: 2
+virtual_models:
+  auto-test:
+    - name: primary
+      base_url: https://upstream.example.invalid
+      api_key: sk-REPLACE-ME
+      model: REPLACE_WITH_UPSTREAM_MODEL
+      auth_style: bearer
+rules:
+  - match:
+      status: [network, bad_stream, stalled_stream, timeout, 401, 403, 404, 429, 500, 502, 503, 504]
+    action: next
+  - match:
+      status: 400
+    action: passthrough

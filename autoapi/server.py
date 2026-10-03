@@ -39,7 +39,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # 引入配置加载相关喵
-from .config import AppConfig, ConfigError, load_config
+from .config import AppConfig, ConfigError, load_config, STATUS_TIMEOUT, STATUS_STALLED_STREAM
 # 引入编排层喵
 from .proxy import handle_request, STATUS_DROP_CONNECTION
 # 引入运行时状态喵
@@ -74,10 +74,10 @@ async def _config_reload_loop(state: RuntimeState, path: Path) -> None:
             绝不能因为编辑器保存了一个写坏的配置就让整个代理停摆喵。
     """
     # 记下上次看到的修改时间，初始为 0 表示还没看过喵
-    last_mtime = 0.0
+    last_mtime = 0
     # 首次进来先取一次当前修改时间，避免启动瞬间白重载一次喵
     try:
-        last_mtime = path.stat().st_mtime
+        last_mtime = path.stat().st_mtime_ns
     # 喵~防御：取不到就保持 0，下一轮循环会当成「变了」而重载一次，无害喵
     except OSError:
         pass
@@ -92,7 +92,7 @@ async def _config_reload_loop(state: RuntimeState, path: Path) -> None:
             # 关掉期间文件可能被改过，把基准时间同步成当前值，
             # 这样重新打开后不会立刻触发一次「补重载」，语义更符合直觉喵
             try:
-                last_mtime = path.stat().st_mtime
+                last_mtime = path.stat().st_mtime_ns
             # 喵~防御：取不到就保持原值，无害喵
             except OSError:
                 pass
@@ -103,7 +103,7 @@ async def _config_reload_loop(state: RuntimeState, path: Path) -> None:
         await asyncio.sleep(max(0.5, interval))
         # 取当前修改时间喵
         try:
-            mtime = path.stat().st_mtime
+            mtime = path.stat().st_mtime_ns
         # 喵~防御：文件被临时删掉或改名时跳过这一轮，等它回来再说喵
         except OSError:
             continue
@@ -304,10 +304,10 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             # 服务端收到客户端请求的起始时刻喵
             request_started_at,
         )
-        # 喵~防御：目标模式超时且配置为断开连接时，直接抛异常中断响应喵
+        # 兼容旧编排结果，不再用抛异常伪装成 TCP 静默断开。
         if not outcome.success and outcome.status == STATUS_DROP_CONNECTION:
-            logger.warning("目标模式超时，断开连接不返回响应喵")
-            raise RuntimeError("目标模式超时，主动断开连接喵")
+            logger.warning("旧版 drop_connection 结果已降级为安全的 HTTP 504 喵")
+            return JSONResponse(outcome.error_body, status_code=504)
         # 编排失败（400 或 502），把错误体作为 JSON 回给客户端喵
         if not outcome.success or outcome.attempt is None:
             return JSONResponse(outcome.error_body, status_code=outcome.status)
@@ -400,9 +400,9 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                     # 尾包 usage 已在 iterator 结束时观察完成，统计事件直接使用最终值喵
                     # 没有 usage 时保持 None，正常 RPM 已记录但 TPM 仍显示未完整上报喵
             # 禁止缓存，否则中间层可能把 SSE 缓存起来导致客户端收不到增量喵
-            stream_headers["Cache-Control"] = "no-cache"
+            stream_headers["cache-control"] = "no-cache"
             # 关掉 nginx 一类反向代理的缓冲，不加这个头会导致流被攒成一大坨才下发喵
-            stream_headers["X-Accel-Buffering"] = "no"
+            stream_headers["x-accel-buffering"] = "no"
             # 喵~防御：content-type 由 media_type 参数单独指定，headers 里留着会重复设置喵
             stream_headers.pop("content-type", None)
             stream_headers.pop("Content-Type", None)
@@ -417,6 +417,17 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                 # SSE 的标准 content-type，上游没给就用这个兜底喵
                 media_type=attempt.media_type or "text/event-stream",
             )
+        # 内部失败别名不能作为 HTTP 状态码；没有上游响应时生成网关错误。
+        response_status = attempt.http_status
+        if response_status is None:
+            response_status = attempt.status if 100 <= attempt.status <= 599 else (
+                504 if attempt.status in {STATUS_TIMEOUT, STATUS_STALLED_STREAM} else 502
+            )
+        if attempt.body is None and attempt.status < 0:
+            return JSONResponse({"error": {
+                "message": attempt.error_text or "上游请求失败喵",
+                "type": "upstream_request_error",
+            }}, status_code=response_status)
         # 非流式路径：响应体已经完整读出来了，直接回喵
         body_headers = dict(attempt.headers)
         # 喵~防御：content-type 交给 media_type 参数处理，避免重复设置头喵
@@ -427,7 +438,7 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             # 上游的完整响应体，取不到时用空字节兜底喵
             content=attempt.body or b"",
             # 上游的真实状态码喵
-            status_code=attempt.status,
+            status_code=response_status,
             # 过滤后的上游响应头喵
             headers=body_headers,
             # 上游声明的 content-type 喵

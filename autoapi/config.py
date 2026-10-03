@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 # re 模块用来编译和匹配规则里的 body_regex 正则喵
 import re
+import math
+from urllib.parse import urlsplit
 # pathlib 提供跨平台的路径对象，比字符串拼路径安全喵
 from pathlib import Path
 # typing 里取 Any 用于标注「任意 YAML 值」喵
@@ -391,6 +393,26 @@ def _parse_status(value: Any, where: str) -> frozenset[int]:
     return frozenset(codes)
 
 
+def _parse_float(raw: Any, where: str) -> float:
+    """Reject booleans/non-finite numbers and report a consistent ConfigError."""
+    if isinstance(raw, bool):
+        raise ConfigError(f"{where} 不能写布尔值喵")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(f"{where} 必须是数字喵") from exc
+    if not math.isfinite(value):
+        raise ConfigError(f"{where} 必须是有限数字，不能写 NaN 或 Infinity 喵")
+    return value
+
+
+def _parse_int(raw: Any, where: str) -> int:
+    value = _parse_float(raw, where)
+    if not value.is_integer():
+        raise ConfigError(f"{where} 必须是整数喵")
+    return int(value)
+
+
 def _parse_rule(raw: Any, index: int) -> Rule:
     """把 YAML 里的一条规则字典解析成 Rule 对象喵~"""
     # 用序号描述位置，报错时用户能立刻定位到第几条规则喵
@@ -401,11 +423,13 @@ def _parse_rule(raw: Any, index: int) -> Rule:
     # 取出动作名，缺失时报错而不是猜一个默认动作喵
     action = raw.get("action")
     # 喵~防御：动作名必须在白名单里，拼错要立刻发现喵
-    if action not in VALID_ACTIONS:
+    if not isinstance(action, str) or action not in VALID_ACTIONS:
         allowed = "、".join(sorted(VALID_ACTIONS))
         raise ConfigError(f"{where} 的 action={action!r} 不合法，只支持：{allowed} 喵")
     # 取出 match 子字典，没写就当成空字典喵
-    match = raw.get("match") or {}
+    match = raw.get("match")
+    if match is None:
+        match = {}
     # 喵~防御：match 必须是字典喵
     if not isinstance(match, dict):
         raise ConfigError(f"{where} 的 match 必须是字典喵")
@@ -438,15 +462,18 @@ def _parse_rule(raw: Any, index: int) -> Rule:
         # 编译好的正则喵
         body_regex=body_regex,
         # 重试次数至少为 1（也就是至少尝试一次），避免配成 0 导致一次都不打喵
-        max_attempts=max(1, int(raw.get("max_attempts", 3))),
+        max_attempts=max(1, _parse_int(raw.get("max_attempts", 3), f"{where}.max_attempts")),
         # 退避基数至少为 1.0，小于 1 会让等待时间越来越短，没有退避意义喵
-        backoff_base=max(1.0, float(raw.get("backoff_base", 1.5))),
+        backoff_base=max(1.0, _parse_float(raw.get("backoff_base", 1.5), f"{where}.backoff_base")),
         # 捕获组序号，None 表示不从消息里抽时长喵
-        freeze_from_group=raw.get("freeze_from_group"),
+        freeze_from_group=(
+            _parse_int(raw["freeze_from_group"], f"{where}.freeze_from_group")
+            if raw.get("freeze_from_group") is not None else None
+        ),
         # 时间单位，默认按分钟解释喵
         freeze_unit=str(raw.get("freeze_unit", "minutes")).strip().lower(),
         # 兜底冻结秒数，至少 1 秒防止配成 0 导致冻结形同虚设喵
-        freeze_seconds=max(1.0, float(raw.get("freeze_seconds", 300.0))),
+        freeze_seconds=max(1.0, _parse_float(raw.get("freeze_seconds", 300.0), f"{where}.freeze_seconds")),
         # 保留原始字典，REPL 保存配置时按原样写回喵
         raw=raw,
     )
@@ -466,18 +493,9 @@ def _parse_optional_timeout(raw: Any, where: str, field_name: str) -> float | No
     # 字段没写或显式为 null，表示跟随全局值喵
     if raw is None:
         return None
-    # 喵~防御：布尔值必须先挡掉，否则 True 会被 float() 变成 1.0 秒喵
-    if isinstance(raw, bool):
-        raise ConfigError(f"{where} 的 {field_name} 不能写布尔值：{raw!r} 喵")
-    # 尝试转成浮点秒数喵
-    try:
-        value = float(raw)
-    # 喵~防御：转不过去说明写的不是数字，明确报错而不是悄悄忽略喵
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"{where} 的 {field_name}={raw!r} 不是数字喵") from exc
-    # 喵~防御：非正数会让请求刚发出就判超时，属于必然出错的配置，直接拒绝喵
+    value = _parse_float(raw, f"{where}.{field_name}")
     if value <= 0:
-        raise ConfigError(f"{where} 的 {field_name}={value} 必须大于 0 喵")
+        raise ConfigError(f"{where} 的 {field_name} 必须大于 0 喵")
     # 返回解析好的秒数喵
     return value
 
@@ -489,11 +507,25 @@ def _parse_candidate(raw: Any, vm_name: str, index: int) -> Candidate:
     # 喵~防御：候选必须是字典喵
     if not isinstance(raw, dict):
         raise ConfigError(f"{where} 必须是字典，实际是 {type(raw).__name__} 喵")
-    # 三个必填字段，缺一个都没法发请求喵
+    values: dict[str, str] = {}
     for required in ("base_url", "api_key", "model"):
-        # 喵~防御：必填字段缺失或为空字符串都要报错，空 key 打过去只会拿到 401 喵
-        if not raw.get(required):
-            raise ConfigError(f"{where} 缺少必填字段 {required} 喵")
+        value = raw.get(required)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"{where} 缺少必填字段 {required} 或它不是非空字符串喵")
+        values[required] = value.strip()
+    # URL 中不允许藏凭据或查询参数，否则日志可能泄露密钥、拼接路径也会出错。
+    try:
+        parsed_url = urlsplit(values["base_url"])
+        valid_url = (
+            parsed_url.scheme in {"http", "https"} and parsed_url.hostname
+            and not parsed_url.username and not parsed_url.password
+            and not parsed_url.query and not parsed_url.fragment
+        )
+        parsed_url.port  # 校验端口语法。
+    except ValueError as exc:
+        raise ConfigError(f"{where}.base_url 不是合法 HTTP(S) 地址喵") from exc
+    if not valid_url:
+        raise ConfigError(f"{where}.base_url 必须是无凭据、无查询串的 HTTP(S) 地址喵")
     # 取鉴权风格，默认 bearer 喵
     auth_style = str(raw.get("auth_style", "bearer")).strip().lower()
     # 喵~防御：鉴权风格必须在白名单里，否则请求头会拼错导致全部 401 喵
@@ -505,11 +537,11 @@ def _parse_candidate(raw: Any, vm_name: str, index: int) -> Candidate:
         # 名字没写就用「虚拟模型名#序号」自动生成一个，保证日志里可区分喵
         name=str(raw.get("name") or f"{vm_name}#{index + 1}"),
         # 去掉 base_url 末尾的斜杠，避免拼路径时出现双斜杠喵
-        base_url=str(raw["base_url"]).strip().rstrip("/"),
+        base_url=values["base_url"].rstrip("/"),
         # api key 去掉首尾空白，防止复制粘贴时带进空格导致鉴权失败喵
-        api_key=str(raw["api_key"]).strip(),
+        api_key=values["api_key"],
         # 真实模型名喵
-        model=str(raw["model"]).strip(),
+        model=values["model"],
         # 鉴权风格喵
         auth_style=auth_style,
         # 这个节点专属的静默上限，没写就是 None 表示跟随全局值喵
@@ -582,7 +614,9 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
     if not isinstance(data, dict):
         raise ConfigError("配置文件顶层必须是字典（是不是文件空了喵？）")
     # 取 server 段，没写就用空字典走全默认值喵
-    server_raw = data.get("server") or {}
+    server_raw = data.get("server")
+    if server_raw is None:
+        server_raw = {}
     # 喵~防御：server 段必须是字典喵
     if not isinstance(server_raw, dict):
         raise ConfigError("server 段必须是字典喵")
@@ -604,30 +638,30 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
         # 监听地址，默认只绑本地喵
         host=str(server_raw.get("host", "127.0.0.1")),
         # 监听端口喵
-        port=int(server_raw.get("port", 8787)),
+        port=_parse_int(server_raw.get("port", 8787), "server.port"),
         # 允许上游静默的上限，至少 1 秒喵
-        stall_timeout=max(1.0, float(server_raw.get("stall_timeout", 60.0))),
+        stall_timeout=max(1.0, _parse_float(server_raw.get("stall_timeout", 60.0), "server.stall_timeout")),
         # 流式请求的总预算，至少 1 秒喵
-        stream_timeout=max(1.0, float(server_raw.get("stream_timeout", 300.0))),
+        stream_timeout=max(1.0, _parse_float(server_raw.get("stream_timeout", 300.0), "server.stream_timeout")),
         # 非流式请求的总预算，至少 1 秒喵
-        nonstream_timeout=max(1.0, float(server_raw.get("nonstream_timeout", 600.0))),
+        nonstream_timeout=max(1.0, _parse_float(server_raw.get("nonstream_timeout", 600.0), "server.nonstream_timeout")),
         # 放行门槛至少 1 个字符。设成 0 或负数等于不设门槛，收到任何内容就放行，
         # 那样就完全失去了防「吐一两个字然后卡死」的能力，所以这里压到 1 喵
-        min_content_chars=max(1, int(server_raw.get("min_content_chars", 10))),
+        min_content_chars=max(1, _parse_int(server_raw.get("min_content_chars", 10), "server.min_content_chars")),
         # 连接超时至少 1 秒喵
-        connect_timeout=max(1.0, float(server_raw.get("connect_timeout", 15.0))),
+        connect_timeout=max(1.0, _parse_float(server_raw.get("connect_timeout", 15.0), "server.connect_timeout")),
         # 自动避险阈值，0 表示关闭。压一个 0 的下限防止配成负数喵
-        auto_hedge_threshold=max(0, int(server_raw.get("auto_hedge_threshold", 5))),
+        auto_hedge_threshold=max(0, _parse_int(server_raw.get("auto_hedge_threshold", 5), "server.auto_hedge_threshold")),
         # 自动避险的冻结时长，至少 0.1 分钟（6 秒），防止配成 0 导致冻结形同虚设喵
-        auto_hedge_minutes=max(0.1, float(server_raw.get("auto_hedge_minutes", 10.0))),
+        auto_hedge_minutes=max(0.1, _parse_float(server_raw.get("auto_hedge_minutes", 10.0), "server.auto_hedge_minutes")),
         # 动态性能统计窗口，至少 0.1 分钟，防止配成 0 导致每次读状态都全清空喵
-        metrics_window_minutes=max(0.1, float(server_raw.get("metrics_window_minutes", 30.0))),
+        metrics_window_minutes=max(0.1, _parse_float(server_raw.get("metrics_window_minutes", 30.0), "server.metrics_window_minutes")),
         # 热重载轮询间隔，允许为 0 表示彻底关闭该功能喵
-        reload_poll_interval=max(0.0, float(server_raw.get("reload_poll_interval", 2.0))),
+        reload_poll_interval=max(0.0, _parse_float(server_raw.get("reload_poll_interval", 2.0), "server.reload_poll_interval")),
         # 目标模式最长等待时长，至少 1 秒喵
-        target_mode_max_wait_seconds=max(1.0, float(server_raw.get("target_mode_max_wait_seconds", 300.0))),
+        target_mode_max_wait_seconds=max(1.0, _parse_float(server_raw.get("target_mode_max_wait_seconds", 300.0), "server.target_mode_max_wait_seconds")),
         # 目标模式每轮等待间隔，至少 0.1 秒喵
-        target_mode_round_interval_seconds=max(0.1, float(server_raw.get("target_mode_round_interval_seconds", 5.0))),
+        target_mode_round_interval_seconds=max(0.1, _parse_float(server_raw.get("target_mode_round_interval_seconds", 5.0), "server.target_mode_round_interval_seconds")),
         # 目标模式超时行为，默认 return_504 喵
         target_mode_timeout_action=str(server_raw.get("target_mode_timeout_action", "return_504")).strip().lower(),
     )
@@ -641,6 +675,9 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
             f"server.target_mode_timeout_action={server.target_mode_timeout_action!r} 不合法，"
             f"只支持：{allowed} 喵"
         )
+    if server.target_mode_timeout_action == "drop_connection":
+        warnings.append("target_mode_timeout_action=drop_connection 已弃用，改为返回 504；ASGI 不能可移植地静默关闭 TCP 喵")
+        server.target_mode_timeout_action = "return_504"
     # 取虚拟模型表喵
     vms_raw = data.get("virtual_models")
     # 喵~防御：虚拟模型表必须存在且是字典，否则代理没有任何可服务的模型喵
@@ -658,7 +695,9 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
             _parse_candidate(item, str(vm_name), i) for i, item in enumerate(chain_raw)
         ]
     # 取规则列表，没写就当空列表喵
-    rules_raw = data.get("rules") or []
+    rules_raw = data.get("rules")
+    if rules_raw is None:
+        rules_raw = []
     # 喵~防御：规则段必须是列表喵
     if not isinstance(rules_raw, list):
         raise ConfigError("rules 必须是列表喵")
@@ -686,7 +725,7 @@ def load_config(path: str | Path) -> AppConfig:
     try:
         text = config_path.read_text(encoding="utf-8")
     # 喵~防御：权限不足或磁盘读取失败时包装成 ConfigError，保持异常类型统一喵
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f"读取配置文件 {config_path} 失败：{exc} 喵") from exc
     # 解析 YAML 文本，safe_load 不会执行任意 Python 对象构造，比 load 安全喵
     try:

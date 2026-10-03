@@ -14,7 +14,7 @@
        里的手改，不会把手改覆盖掉）
     2. 在这份字典上做改动
     3. 送进 parse_config 完整校验
-    4. 只有校验通过才替换内存里的配置，并写回磁盘
+    4. 只有校验通过并原子写回磁盘后，才替换内存里的配置
     校验不通过就打印错误、什么都不改，跑着的代理继续用旧配置服务，绝不会被一条写坏的
     规则搞停摆喵。
 """
@@ -28,6 +28,8 @@ import copy
 from datetime import datetime
 # os 用来读取 NO_COLOR 环境变量喵
 import os
+import tempfile
+from pathlib import Path
 # shutil 用来读取终端窗口宽度喵
 import shutil
 # json 用来解析 rule add 命令的参数、以及打印规则内容喵
@@ -433,15 +435,36 @@ class Repl:
         # 主人注意：PyYAML 不保留注释，所以 save 会把 config.yaml 里的中文注释冲掉。
         # 想保住注释的话，建议手改文件再用 reload 命令，而不是用 rule add / save 喵。
         text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
-        # 写回文件，显式 utf-8 保证中文正常喵
-        path.write_text(text, encoding="utf-8")
+        # 先写同目录临时文件，再原子替换，避免热重载读到半截 YAML。
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(text)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, path)
+        except OSError as exc:
+            raise ConfigError(f"无法原子保存配置文件 {path} 喵：{exc}") from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _commit(self, data: dict[str, Any]) -> None:
+        """Validate, persist, then publish; disk failure leaves memory unchanged."""
+        new_config = parse_config(data, source_path=self.state.config.source_path)
+        self._save(data)
+        self.state.replace_config(new_config)
 
     def _mutate_config(self, mutator) -> None:
         """
-        改配置的统一流程：重读 → 改 → 校验 → 应用 → 保存喵~
+        改配置的统一流程：重读 → 改 → 校验 → 原子保存 → 应用喵~
 
         输入：mutator 是个函数，接收整份配置字典并原地改动它，返回一段描述改了什么的文本
-        说明：把「重读、校验、应用、保存」这四步公共流程收在这里，各个命令只关心怎么改。
+        说明：把「重读、校验、保存、应用」这四步公共流程收在这里，各个命令只关心怎么改。
              顺序上先校验后写盘很关键 —— 校验失败时磁盘上的文件还完全没被动过，
              运行中的代理也继续用旧配置，绝不会被一次手滑搞坏喵。
         """
@@ -449,10 +472,8 @@ class Repl:
         data = self._read_raw_yaml()
         # 交给具体命令去改动，并拿回一段描述文本喵
         summary = mutator(data)
-        # 先校验并应用，失败会抛异常，此时磁盘上的文件还没被动过，最安全喵
-        self._apply(data)
-        # 校验通过了才写盘喵
-        self._save(data)
+        # 校验并原子保存成功后才发布；失败时文件和内存都保持旧配置。
+        self._commit(data)
         # 打印改动摘要喵
         print(f"{summary}，已生效并写回配置文件喵~")
 
@@ -1223,9 +1244,7 @@ class Repl:
         # 重读磁盘配置喵
         data = self._read_raw_yaml()
         # 先校验一遍，坏配置不给写盘喵
-        self._apply(data)
-        # 写回磁盘喵
-        self._save(data)
+        self._commit(data)
         # 打印结果喵
         print("配置已校验并写回 config.yaml 喵~")
 
@@ -1620,7 +1639,7 @@ class Repl:
             EOFError   主人按了 Ctrl+D，或者进程的 stdin 被重定向到 /dev/null
                        （用 nohup 后台跑时就是这样），此时安静退出 REPL 循环，
                        但不结束进程 —— 代理还得继续服务喵
-            KeyboardInterrupt 主人按了 Ctrl+C，提示用 quit 退出而不是直接杀掉喵
+            KeyboardInterrupt 主人按了 Ctrl+C，通知主线程优雅关闭代理喵
             其他异常  打印出来但不让 REPL 线程死掉，免得一个手滑的命令就没法交互了喵
         """
         # 打印欢迎语和提示喵
@@ -1695,10 +1714,12 @@ class Repl:
             except EOFError:
                 print("\n检测到 stdin 已关闭，交互式命令行退出，代理继续在后台服务喵~")
                 return
-            # 喵~防御：Ctrl+C 时不直接杀进程，提示用 quit 优雅退出喵
+            # prompt_toolkit can consume Ctrl+C as an input exception rather
+            # than sending SIGINT to Uvicorn. Use the same graceful exit as quit.
             except KeyboardInterrupt:
-                print("\n想退出的话敲 quit 喵~")
-                continue
+                print("\n收到 Ctrl+C，正在停止代理喵~")
+                self.should_exit.set()
+                return
             # 喵~防御：prompt_toolkit 在某些终端下可能抛别的异常，
             # 这时候降级成朴素模式继续服务，而不是让 REPL 线程死掉喵
             except Exception as exc:  # noqa: BLE001

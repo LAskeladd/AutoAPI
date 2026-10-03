@@ -21,3 +21,28 @@ venv/
 
 # 运行日志喵
 *.log
+
+# Local review archives, isolated test artifacts and temporary credential files.
+_repo_reviews/
+.test-artifacts/
+.config.yaml.*.tmp
+config.local.example.*
+.env
+.env.*
+!.env.example
+
+# Only the repaired AutoAPI source is part of this publication.
+/AutoAPI-合并工程/
+/AutoAPI-合并规划/
+/AutoAPI-GitHub发布版/
+/data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+config.json
+config.json.*
+!config.local.example.yaml

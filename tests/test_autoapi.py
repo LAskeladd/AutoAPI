@@ -1794,9 +1794,11 @@ async def test_上游读取异常不标记流式正常完成():
     )
     # 收集代理已成功转发的前缀字节喵
     collected = b""
-    # 消费转发迭代器；内部会吞掉预期的 HTTPX 读取异常喵
-    async for chunk in iter_upstream_bytes(result):
-        collected += chunk
+    # 放行后的异常必须继续抛出，不能伪装成一次干净结束。
+    with pytest.raises(httpx.ReadError):
+        async for chunk in iter_upstream_bytes(result):
+            collected += chunk
+    assert result.response.is_closed
     # 已经成功转发的前缀必须保留喵
     assert collected == b"data: partial\n\n"
     # 读取异常不能被标记为完整结束，server 因此不会写入平均耗时喵
@@ -2224,7 +2226,7 @@ async def test_目标模式可配置超时行为_return_502(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_目标模式可配置超时行为_drop_connection(monkeypatch):
-    """目标模式配置为 drop_connection 时应返回特殊状态码喵~"""
+    """旧版 drop_connection 配置应安全降级为 HTTP 504 喵~"""
     current_time = 1000.0
     async def fake_sleep(seconds: float) -> None:
         nonlocal current_time
@@ -2247,11 +2249,10 @@ async def test_目标模式可配置超时行为_drop_connection(monkeypatch):
     state.set_target_mode(True)
     # 运行请求喵
     outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
-    # 应该返回特殊的断开连接状态码喵
+    # 旧配置也安全降级为标准 504，避免服务层抛 RuntimeError 返回 500。
     assert outcome.success is False
-    from autoapi.proxy import STATUS_DROP_CONNECTION
-    assert outcome.status == STATUS_DROP_CONNECTION
-    assert outcome.error_body["error"]["type"] == "target_mode_drop_connection"
+    assert outcome.status == 504
+    assert outcome.error_body["error"]["type"] == "target_mode_gateway_timeout"
 
 
 def test_目标模式开关默认关闭且不写配置():
@@ -2699,16 +2700,16 @@ def test_冻结空闲历史格显示青色且有请求格仍按状态色(monkeyp
     assert snapshot.buckets[-2].frozen is False
 
 
-def test_冻结自然过期后历史区间会被记录():
+def test_冻结自然过期后历史区间会被记录(monkeypatch):
     """冻结自然到期后，历史快照应保留这段冻结区间的影响喵~"""
     # 造状态和候选喵
     state = make_state()
     candidate = state.config.virtual_models["auto-test"][0]
-    # 冻结一个极短区间喵
+    # 使用可控单调时钟；Windows 的时钟粒度可能大于原来的 10ms sleep。
+    monkeypatch.setattr("autoapi.state.time.monotonic", lambda: 1000.0)
     state.freeze(candidate, 0.001, "测试冻结")
-    # 等待读取时触发惰性过期并归档区间喵
-    import time as _time
-    _time.sleep(0.01)
+    assert state.is_frozen(candidate) > 0
+    monkeypatch.setattr("autoapi.state.time.monotonic", lambda: 1000.01)
     assert state.is_frozen(candidate) == 0
     # 历史冻结区间应已经写入内部历史表喵
     assert state._freeze_intervals[candidate.identity]
